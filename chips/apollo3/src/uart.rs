@@ -11,6 +11,7 @@ use kernel::hil;
 use kernel::hil::uart;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::cells::TakeCell;
+use kernel::utilities::packet_buffer::PacketBufferMut;
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
 use kernel::utilities::StaticRef;
@@ -164,10 +165,10 @@ register_bitfields![u32,
     ]
 ];
 
-pub struct Uart<'a> {
+pub struct Uart<'a, const HEAD: usize, const TAIL: usize> {
     registers: StaticRef<UartRegisters>,
     clock_frequency: u32,
-    tx_client: OptionalCell<&'a dyn hil::uart::TransmitClient>,
+    tx_client: OptionalCell<&'a dyn hil::uart::TransmitClient<HEAD, TAIL>>,
     rx_client: OptionalCell<&'a dyn hil::uart::ReceiveClient>,
 
     tx_buffer: TakeCell<'static, [u8]>,
@@ -184,7 +185,7 @@ pub struct UartParams {
     pub baud_rate: u32,
 }
 
-impl Uart<'_> {
+impl<'a, const HEAD: usize, const TAIL: usize> Uart<'a, HEAD, TAIL> {
     // unsafe bc of UART0_BASE usage, called twice would alias location
     pub fn new_uart_0() -> Self {
         Self {
@@ -386,7 +387,7 @@ impl Uart<'_> {
     }
 }
 
-impl hil::uart::Configure for Uart<'_> {
+impl<'a, const HEAD: usize, const TAIL: usize> hil::uart::Configure for Uart<'a, HEAD, TAIL> {
     fn configure(&self, params: hil::uart::Parameters) -> Result<(), ErrorCode> {
         let regs = self.registers;
 
@@ -415,16 +416,16 @@ impl hil::uart::Configure for Uart<'_> {
     }
 }
 
-impl<'a> hil::uart::Transmit<'a> for Uart<'a> {
-    fn set_transmit_client(&self, client: &'a dyn hil::uart::TransmitClient) {
+impl<'a, const HEAD: usize, const TAIL: usize> hil::uart::Transmit<'a, HEAD, TAIL> for Uart<'a> {
+    fn set_transmit_client(&self, client: &'a dyn hil::uart::TransmitClient<HEAD, TAIL>) {
         self.tx_client.set(client);
     }
 
     fn transmit_buffer(
         &self,
-        tx_data: &'static mut [u8],
+        tx_data: PacketBufferMut<HEAD, TAIL>,
         tx_len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+    ) -> Result<(), (ErrorCode, PacketBufferMut<HEAD, TAIL>)> {
         if tx_len == 0 || tx_len > tx_data.len() {
             Err((ErrorCode::SIZE, tx_data))
         } else if self.tx_buffer.is_some() {

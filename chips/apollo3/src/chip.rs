@@ -30,10 +30,10 @@ impl<I: InterruptService + 'static> Apollo3<I> {
 /// If a board wishes to use only a subset of these peripherals, this
 /// should not be used or imported, and a modified version should be
 /// constructed manually in main.rs.
-pub struct Apollo3DefaultPeripherals {
+pub struct Apollo3DefaultPeripherals<const HEAD: usize, const TAIL: usize> {
     pub stimer: crate::stimer::STimer<'static>,
-    pub uart0: crate::uart::Uart<'static>,
-    pub uart1: crate::uart::Uart<'static>,
+    pub uart0: crate::uart::Uart<'static, HEAD, TAIL>,
+    pub uart1: crate::uart::Uart<'static, HEAD, TAIL>,
     pub gpio_port: crate::gpio::Port<'static>,
     pub iom0: crate::iom::Iom<'static>,
     pub iom1: crate::iom::Iom<'static>,
@@ -46,7 +46,7 @@ pub struct Apollo3DefaultPeripherals {
     pub flash_ctrl: crate::flashctrl::FlashCtrl<'static>,
 }
 
-impl Apollo3DefaultPeripherals {
+impl<const HEAD: usize, const TAIL: usize> Apollo3DefaultPeripherals<HEAD, TAIL> {
     pub fn new() -> Self {
         Self {
             stimer: crate::stimer::STimer::new(),
@@ -70,7 +70,9 @@ impl Apollo3DefaultPeripherals {
     }
 }
 
-impl kernel::platform::chip::InterruptService for Apollo3DefaultPeripherals {
+impl<const HEAD: usize, const TAIL: usize> kernel::platform::chip::InterruptService
+    for Apollo3DefaultPeripherals<HEAD, TAIL>
+{
     unsafe fn service_interrupt(&self, interrupt: u32) -> bool {
         use crate::nvic;
         match interrupt {

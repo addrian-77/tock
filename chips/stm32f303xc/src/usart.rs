@@ -8,6 +8,7 @@ use kernel::deferred_call::{DeferredCall, DeferredCallClient};
 use kernel::hil;
 use kernel::platform::chip::ClockInterface;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::packet_buffer::PacketBufferMut;
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, ReadOnly, ReadWrite};
 use kernel::utilities::StaticRef;
@@ -519,16 +520,16 @@ impl DeferredCallClient for Usart<'_> {
     }
 }
 
-impl<'a> hil::uart::Transmit<'a> for Usart<'a> {
-    fn set_transmit_client(&self, client: &'a dyn hil::uart::TransmitClient) {
+impl<'a, const HEAD: usize, const TAIL: usize> hil::uart::Transmit<'a, HEAD, TAIL> for Usart<'a> {
+    fn set_transmit_client(&self, client: &'a dyn hil::uart::TransmitClient<HEAD, TAIL>) {
         self.tx_client.set(client);
     }
 
     fn transmit_buffer(
         &self,
-        tx_data: &'static mut [u8],
+        tx_data: PacketBufferMut<HEAD, TAIL>,
         tx_len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+    ) -> Result<(), (ErrorCode, PacketBufferMut<HEAD, TAIL>)> {
         if self.tx_status.get() == USARTStateTX::Idle {
             if tx_len <= tx_data.len() {
                 self.tx_buffer.put(Some(tx_data));

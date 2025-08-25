@@ -90,6 +90,7 @@ use kernel::hil;
 use kernel::hil::time::ConvertTicks;
 use kernel::hil::uart;
 use kernel::utilities::cells::{OptionalCell, TakeCell, VolatileCell};
+use kernel::utilities::packet_buffer::PacketBufferMut;
 use kernel::ErrorCode;
 
 /// Suggested length for the up buffer to pass to the Segger RTT capsule.
@@ -207,11 +208,11 @@ impl<'a> SeggerRttMemory<'a> {
     }
 }
 
-pub struct SeggerRtt<'a, A: hil::time::Alarm<'a>> {
+pub struct SeggerRtt<'a, A: hil::time::Alarm<'a>, const HEAD: usize, const TAIL: usize> {
     alarm: &'a A, // Dummy alarm so we can get a callback.
     config: TakeCell<'a, SeggerRttMemory<'a>>,
-    tx_client: OptionalCell<&'a dyn uart::TransmitClient>,
-    tx_client_buffer: TakeCell<'static, [u8]>,
+    tx_client: OptionalCell<&'a dyn uart::TransmitClient<HEAD, TAIL>>,
+    tx_client_buffer: TakeCell<'static, PacketBufferMut<HEAD, TAIL>>,
     tx_len: Cell<usize>,
     rx_client: OptionalCell<&'a dyn uart::ReceiveClient>,
     rx_client_buffer: TakeCell<'static, [u8]>,
@@ -219,8 +220,10 @@ pub struct SeggerRtt<'a, A: hil::time::Alarm<'a>> {
     rx_len: Cell<usize>,
 }
 
-impl<'a, A: hil::time::Alarm<'a>> SeggerRtt<'a, A> {
-    pub fn new(alarm: &'a A, config: &'a mut SeggerRttMemory<'a>) -> SeggerRtt<'a, A> {
+impl<'a, A: hil::time::Alarm<'a>, const HEAD: usize, const TAIL: usize>
+    SeggerRtt<'a, A, HEAD, TAIL>
+{
+    pub fn new(alarm: &'a A, config: &'a mut SeggerRttMemory<'a>) -> SeggerRtt<'a, A, HEAD, TAIL> {
         SeggerRtt {
             alarm,
             config: TakeCell::new(config),
@@ -235,16 +238,18 @@ impl<'a, A: hil::time::Alarm<'a>> SeggerRtt<'a, A> {
     }
 }
 
-impl<'a, A: hil::time::Alarm<'a>> uart::Transmit<'a> for SeggerRtt<'a, A> {
-    fn set_transmit_client(&self, client: &'a dyn uart::TransmitClient) {
+impl<'a, A: hil::time::Alarm<'a>, const HEAD: usize, const TAIL: usize>
+    uart::Transmit<'a, HEAD, TAIL> for SeggerRtt<'a, A, HEAD, TAIL>
+{
+    fn set_transmit_client(&self, client: &'a dyn uart::TransmitClient<HEAD, TAIL>) {
         self.tx_client.set(client);
     }
 
     fn transmit_buffer(
         &self,
-        tx_data: &'static mut [u8],
+        tx_data: PacketBufferMut<HEAD, TAIL>,
         tx_len: usize,
-    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+    ) -> Result<(), (ErrorCode, PacketBufferMut<HEAD, TAIL>)> {
         if self.config.is_some() {
             self.config.map(|config| {
                 // Copy the incoming data into the buffer. Once we increment
@@ -292,7 +297,9 @@ impl<'a, A: hil::time::Alarm<'a>> uart::Transmit<'a> for SeggerRtt<'a, A> {
     }
 }
 
-impl<'a, A: hil::time::Alarm<'a>> hil::time::AlarmClient for SeggerRtt<'a, A> {
+impl<'a, A: hil::time::Alarm<'a>, const HEAD: usize, const TAIL: usize> hil::time::AlarmClient
+    for SeggerRtt<'a, A, HEAD, TAIL>
+{
     fn alarm(&self) {
         self.tx_client.map(|client| {
             self.tx_client_buffer.take().map(|buffer| {

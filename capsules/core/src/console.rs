@@ -41,15 +41,19 @@
 //! the driver. Successive writes must call `allow` each time a buffer is to be
 //! written.
 
+use cortex_m_semihosting::{hprint, hprintln};
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, GrantKernelData, UpcallCount};
 use kernel::hil::uart;
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
+use kernel::utilities::copy_slice::CopyOrErr;
+use kernel::utilities::packet_buffer::{PacketBufferDyn, PacketBufferMut, PacketSliceMut};
 use kernel::{ErrorCode, ProcessId};
 
 /// Syscall driver number.
 use crate::driver;
+use crate::i2c_master::BUFFER_LENGTH;
 pub const DRIVER_NUM: usize = driver::NUM::Console as usize;
 
 /// Default size for the read and write buffers used by the console.
@@ -99,8 +103,14 @@ pub struct App {
     read_len: usize,
 }
 
-pub struct Console<'a> {
-    uart: &'a dyn uart::UartData<'a>,
+pub struct Console<
+    'a,
+    const HEAD: usize,
+    const TAIL: usize,
+    const LOWER_HEAD: usize,
+    const LOWER_TAIL: usize,
+> {
+    uart: &'a dyn uart::UartData<'a, LOWER_HEAD, LOWER_TAIL>,
     apps: Grant<
         App,
         UpcallCount<{ upcall::COUNT }>,
@@ -108,15 +118,22 @@ pub struct Console<'a> {
         AllowRwCount<{ rw_allow::COUNT }>,
     >,
     tx_in_progress: OptionalCell<ProcessId>,
-    tx_buffer: TakeCell<'static, [u8]>,
+    tx_buffer: OptionalCell<PacketBufferMut<HEAD, TAIL>>,
     rx_in_progress: OptionalCell<ProcessId>,
     rx_buffer: TakeCell<'static, [u8]>,
 }
 
-impl<'a> Console<'a> {
+impl<
+        'a,
+        const HEAD: usize,
+        const TAIL: usize,
+        const LOWER_HEAD: usize,
+        const LOWER_TAIL: usize,
+    > Console<'a, HEAD, TAIL, LOWER_HEAD, LOWER_TAIL>
+{
     pub fn new(
-        uart: &'a dyn uart::UartData<'a>,
-        tx_buffer: &'static mut [u8],
+        uart: &'a dyn uart::UartData<'a, LOWER_HEAD, LOWER_TAIL>,
+        tx_buffer: PacketBufferMut<HEAD, TAIL>,
         rx_buffer: &'static mut [u8],
         grant: Grant<
             App,
@@ -124,12 +141,12 @@ impl<'a> Console<'a> {
             AllowRoCount<{ ro_allow::COUNT }>,
             AllowRwCount<{ rw_allow::COUNT }>,
         >,
-    ) -> Console<'a> {
+    ) -> Console<'a, HEAD, TAIL, LOWER_HEAD, LOWER_TAIL> {
         Console {
             uart,
             apps: grant,
             tx_in_progress: OptionalCell::empty(),
-            tx_buffer: TakeCell::new(tx_buffer),
+            tx_buffer: OptionalCell::new(tx_buffer),
             rx_in_progress: OptionalCell::empty(),
             rx_buffer: TakeCell::new(rx_buffer),
         }
@@ -178,7 +195,7 @@ impl<'a> Console<'a> {
     fn send(&self, processid: ProcessId, app: &mut App, kernel_data: &GrantKernelData) {
         if self.tx_in_progress.is_none() {
             self.tx_in_progress.set(processid);
-            self.tx_buffer.take().map(|buffer| {
+            self.tx_buffer.take().map(|mut tx_buffer| {
                 let transaction_len = kernel_data
                     .get_readonly_processbuffer(ro_allow::WRITE)
                     .and_then(|write| {
@@ -201,28 +218,36 @@ impl<'a> Console<'a> {
                                     return 0;
                                 }
                             };
+                            let mut buffer = [0u8; 1024];
                             for (i, c) in remaining_data.iter().enumerate() {
                                 if buffer.len() <= i {
                                     return i; // Short circuit on partial send
                                 }
                                 buffer[i] = c.get();
                             }
+                            let _ =
+                                tx_buffer.copy_from_slice_or_err(&buffer[..remaining_data.len()]);
                             app.write_remaining
                         })
                     })
                     .unwrap_or(0);
                 app.write_remaining -= transaction_len;
-                if let Err((_e, tx_buffer)) = self.uart.transmit_buffer(buffer, transaction_len) {
-                    // The UART didn't start, so we will not get a transmit
-                    // done callback. Need to signal the app now.
-                    self.tx_buffer.replace(tx_buffer);
-                    self.tx_in_progress.clear();
+                // if let Err((_e, tx_buffer)) = self.uart.transmit_buffer(buffer, transaction_len) {
+                //     // The UART didn't start, so we will not get a transmit
+                //     // done callback. Need to signal the app now.
+                //     self.tx_buffer.replace(tx_buffer);
+                //     self.tx_in_progress.clear();
 
-                    // Go ahead and signal the application
-                    let written = app.write_len;
-                    app.write_len = 0;
-                    kernel_data.schedule_upcall(1, (written, 0, 0)).ok();
-                }
+                //     // Go ahead and signal the application
+                //     let written = app.write_len;
+                //     app.write_len = 0;
+                //     kernel_data.schedule_upcall(1, (written, 0, 0)).ok();
+                // }
+                let process_id: [u8; 1] = (processid.id() as u8).to_ne_bytes();
+                let buf = tx_buffer
+                    .prepend::<LOWER_HEAD, 1>(&process_id)
+                    .reduce_tailroom();
+                let _ = self.uart.transmit_buffer(buf, transaction_len);
             });
         } else {
             app.pending_write = true;
@@ -268,7 +293,9 @@ impl<'a> Console<'a> {
     }
 }
 
-impl SyscallDriver for Console<'_> {
+impl<const HEAD: usize, const TAIL: usize, const LOWER_HEAD: usize, const LOWER_TAIL: usize>
+    SyscallDriver for Console<'_, HEAD, TAIL, LOWER_HEAD, LOWER_TAIL>
+{
     /// Initiate serial transfers
     ///
     /// ### `command_num`
@@ -323,16 +350,20 @@ impl SyscallDriver for Console<'_> {
     }
 }
 
-impl uart::TransmitClient for Console<'_> {
+impl<const HEAD: usize, const TAIL: usize, const LOWER_HEAD: usize, const LOWER_TAIL: usize>
+    uart::TransmitClient<LOWER_HEAD, LOWER_TAIL>
+    for Console<'_, HEAD, TAIL, LOWER_HEAD, LOWER_TAIL>
+{
     fn transmitted_buffer(
         &self,
-        buffer: &'static mut [u8],
+        buffer: PacketBufferMut<LOWER_HEAD, LOWER_TAIL>,
         _tx_len: usize,
         _rcode: Result<(), ErrorCode>,
     ) {
         // Either print more from the AppSlice or send a callback to the
         // application.
-        self.tx_buffer.replace(buffer);
+        let new_buf = buffer.reset::<HEAD, TAIL>().unwrap();
+        self.tx_buffer.replace(new_buf);
         self.tx_in_progress.take().map(|processid| {
             self.apps.enter(processid, |app, kernel_data| {
                 match self.send_continue(processid, app, kernel_data) {
@@ -372,7 +403,9 @@ impl uart::TransmitClient for Console<'_> {
     }
 }
 
-impl uart::ReceiveClient for Console<'_> {
+impl<const HEAD: usize, const TAIL: usize, const LOWER_HEAD: usize, const LOWER_TAIL: usize>
+    uart::ReceiveClient for Console<'_, HEAD, TAIL, LOWER_HEAD, LOWER_TAIL>
+{
     fn received_buffer(
         &self,
         buffer: &'static mut [u8],

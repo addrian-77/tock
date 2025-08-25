@@ -8,10 +8,13 @@
 mod fmt;
 
 use core::cell::Cell;
+use core::usize;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, UpcallCount};
 use kernel::hil::uart::{Transmit, TransmitClient};
 use kernel::syscall::CommandReturn;
+use kernel::utilities::copy_slice::CopyOrErr;
+use kernel::utilities::packet_buffer::{self, PacketBufferDyn, PacketBufferMut, PacketSliceMut};
 use kernel::{ErrorCode, ProcessId};
 
 // LowLevelDebug requires a &mut [u8] buffer of length at least BUF_LEN.
@@ -19,8 +22,15 @@ pub use fmt::BUF_LEN;
 
 pub const DRIVER_NUM: usize = crate::driver::NUM::LowLevelDebug as usize;
 
-pub struct LowLevelDebug<'u, U: Transmit<'u>> {
-    buffer: Cell<Option<&'static mut [u8]>>,
+pub struct LowLevelDebug<
+    'u,
+    U: Transmit<'u, HEAD_TRANSMIT, TAIL_TRANSMIT>,
+    const HEAD: usize,
+    const TAIL: usize,
+    const HEAD_TRANSMIT: usize,
+    const TAIL_TRANSMIT: usize,
+> {
+    buffer: Cell<Option<PacketBufferMut<HEAD, TAIL>>>,
     grant: Grant<AppData, UpcallCount<0>, AllowRoCount<0>, AllowRwCount<0>>,
     // grant_failed is set to true when LowLevelDebug fails to allocate an app's
     // grant region. When it has a chance, LowLevelDebug will print a message
@@ -32,12 +42,20 @@ pub struct LowLevelDebug<'u, U: Transmit<'u>> {
     uart: &'u U,
 }
 
-impl<'u, U: Transmit<'u>> LowLevelDebug<'u, U> {
+impl<
+        'u,
+        U: Transmit<'u, HEAD_TRANSMIT, TAIL_TRANSMIT>,
+        const HEAD: usize,
+        const TAIL: usize,
+        const HEAD_TRANSMIT: usize,
+        const TAIL_TRANSMIT: usize,
+    > LowLevelDebug<'u, U, HEAD, TAIL, HEAD_TRANSMIT, TAIL_TRANSMIT>
+{
     pub fn new(
-        buffer: &'static mut [u8],
+        buffer: PacketBufferMut<HEAD, TAIL>,
         uart: &'u U,
         grant: Grant<AppData, UpcallCount<0>, AllowRoCount<0>, AllowRwCount<0>>,
-    ) -> LowLevelDebug<'u, U> {
+    ) -> LowLevelDebug<'u, U, HEAD, TAIL, HEAD_TRANSMIT, TAIL_TRANSMIT> {
         LowLevelDebug {
             buffer: Cell::new(Some(buffer)),
             grant,
@@ -47,7 +65,16 @@ impl<'u, U: Transmit<'u>> LowLevelDebug<'u, U> {
     }
 }
 
-impl<'u, U: Transmit<'u>> kernel::syscall::SyscallDriver for LowLevelDebug<'u, U> {
+impl<
+        'u,
+        U: Transmit<'u, HEAD_TRANSMIT, TAIL_TRANSMIT>,
+        const HEAD: usize,
+        const TAIL: usize,
+        const HEAD_TRANSMIT: usize,
+        const TAIL_TRANSMIT: usize,
+    > kernel::syscall::SyscallDriver
+    for LowLevelDebug<'u, U, HEAD, TAIL, HEAD_TRANSMIT, TAIL_TRANSMIT>
+{
     fn command(
         &self,
         minor_num: usize,
@@ -70,10 +97,19 @@ impl<'u, U: Transmit<'u>> kernel::syscall::SyscallDriver for LowLevelDebug<'u, U
     }
 }
 
-impl<'u, U: Transmit<'u>> TransmitClient for LowLevelDebug<'u, U> {
+impl<
+        'u,
+        U: Transmit<'u, HEAD_TRANSMIT, TAIL_TRANSMIT>,
+        const HEAD: usize,
+        const TAIL: usize,
+        const HEAD_TRANSMIT: usize,
+        const TAIL_TRANSMIT: usize,
+    > TransmitClient<HEAD_TRANSMIT, TAIL_TRANSMIT>
+    for LowLevelDebug<'u, U, HEAD, TAIL, HEAD_TRANSMIT, TAIL_TRANSMIT>
+{
     fn transmitted_buffer(
         &self,
-        tx_buffer: &'static mut [u8],
+        mut tx_buffer: PacketBufferMut<HEAD_TRANSMIT, TAIL_TRANSMIT>,
         _tx_len: usize,
         _rval: Result<(), ErrorCode>,
     ) {
@@ -84,12 +120,11 @@ impl<'u, U: Transmit<'u>> TransmitClient for LowLevelDebug<'u, U> {
         // debug entries.
         if self.grant_failed.take() {
             const MESSAGE: &[u8] = b"LowLevelDebug: grant init failed\n";
-            tx_buffer[..MESSAGE.len()].copy_from_slice(MESSAGE);
+
+            let _ = tx_buffer.copy_from_slice_or_err(MESSAGE);
 
             let _ = self.uart.transmit_buffer(tx_buffer, MESSAGE.len()).map_err(
-                |(_, returned_buffer)| {
-                    self.buffer.set(Some(returned_buffer));
-                },
+                |(_, returned_buffer)| self.buffer.set(Some(returned_buffer.reset().unwrap())),
             );
             return;
         }
@@ -107,7 +142,7 @@ impl<'u, U: Transmit<'u>> TransmitClient for LowLevelDebug<'u, U> {
             self.transmit_entry(tx_buffer, app_num, to_print);
             return;
         }
-        self.buffer.set(Some(tx_buffer));
+        self.buffer.set(Some(tx_buffer.reset().unwrap()))
     }
 }
 
@@ -115,14 +150,23 @@ impl<'u, U: Transmit<'u>> TransmitClient for LowLevelDebug<'u, U> {
 // Implementation details below
 // -----------------------------------------------------------------------------
 
-impl<'u, U: Transmit<'u>> LowLevelDebug<'u, U> {
+impl<
+        'u,
+        U: Transmit<'u, HEAD_TRANSMIT, TAIL_TRANSMIT>,
+        const HEAD: usize,
+        const TAIL: usize,
+        const HEAD_TRANSMIT: usize,
+        const TAIL_TRANSMIT: usize,
+    > LowLevelDebug<'u, U, HEAD, TAIL, HEAD_TRANSMIT, TAIL_TRANSMIT>
+{
     // If the UART is not busy (the buffer is available), transmits the entry.
     // Otherwise, adds it to the app's queue.
     fn push_entry(&self, entry: DebugEntry, processid: ProcessId) {
         use DebugEntry::Dropped;
 
         if let Some(buffer) = self.buffer.take() {
-            self.transmit_entry(buffer, processid.id(), entry);
+            let new_head_buf = buffer.reduce_headroom().reduce_tailroom();
+            self.transmit_entry(new_head_buf, processid.id(), entry);
             return;
         }
 
@@ -152,15 +196,25 @@ impl<'u, U: Transmit<'u>> LowLevelDebug<'u, U> {
     }
 
     // Immediately prints the provided entry to the UART.
-    fn transmit_entry(&self, buffer: &'static mut [u8], app_num: usize, entry: DebugEntry) {
-        let msg_len = fmt::format_entry(app_num, entry, buffer);
+    fn transmit_entry(
+        &self,
+        mut buffer: PacketBufferMut<HEAD_TRANSMIT, TAIL_TRANSMIT>,
+        app_num: usize,
+        entry: DebugEntry,
+    ) {
+        let msg_len = fmt::format_entry(app_num, entry, &mut buffer.payload_mut());
         // The uart's error message is ignored because we cannot do anything if
         // it fails anyway.
         let _ = self
             .uart
             .transmit_buffer(buffer, msg_len)
             .map_err(|(_, returned_buffer)| {
-                self.buffer.set(Some(returned_buffer));
+                let pb = returned_buffer
+                    .reclaim_headroom()
+                    .unwrap()
+                    .reclaim_tailroom()
+                    .unwrap();
+                self.buffer.set(Some(pb));
             });
     }
 }
